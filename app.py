@@ -14,14 +14,13 @@ from sanic_cors import CORS
 
 
 app = Sanic("ShoppingListAPI")
-CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
 
 
 # household_code -> set of connected websockets
 connections: dict[str, set] = defaultdict(set)
 
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*")
-
+CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
 
 @app.before_server_start
 async def setup_db(app):
