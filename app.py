@@ -10,7 +10,12 @@ from sanic.response import json as json_response
 
 import db
 
+from sanic_cors import CORS
+
+
 app = Sanic("ShoppingListAPI")
+CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
+
 
 # household_code -> set of connected websockets
 connections: dict[str, set] = defaultdict(set)
@@ -26,13 +31,6 @@ async def setup_db(app):
 @app.after_server_stop
 async def teardown_db(app):
     await db.close_pool()
-
-
-@app.middleware("response")
-async def add_cors_headers(request, response):
-    response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGINS
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
 
 
 @app.options("/<path:path>")
