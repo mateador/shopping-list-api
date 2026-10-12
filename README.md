@@ -74,13 +74,106 @@ Postgres, which expires after 30 days.
 | DELETE | `/api/households/<code>/items/<id>` | Remove an item |
 | POST | `/api/households/<code>/list/close` | Close current list, open a new one |
 | GET | `/api/households/<code>/history` | Past closed lists |
+| POST | `/api/households/<code>/webhooks` | Register a subscriber `{url}`; returns its `secret` once |
+| GET | `/api/households/<code>/webhooks` | List subscribers (id, url, active; never secrets) |
+| DELETE | `/api/households/<code>/webhooks/<id>` | Deactivate a subscriber |
+| POST | `/api/webhooks/<code>/events` | Inbound signed events from third parties |
 | WS | `/ws/<code>` | Live state updates |
 
 ## Files
 
 ```
-app.py    — routes, CORS, WebSocket connection/broadcast handling
-db.py     — asyncpg pool, schema, all queries (households/lists/items)
+app.py             — routes, CORS, WebSocket connection/broadcast handling
+db.py              — asyncpg pool, schema, all queries (households/lists/items/webhooks)
+webhooks.py        — signing, URL checks, outbound delivery with retries
+webhook_config.py  — attempts, backoff, timeout, subscription cap
+tests/             — pytest suite (in-memory fake db, no network)
+```
+
+## Webhooks
+
+Both directions use the same signature scheme: `X-Webhook-Signature:
+sha256=<hex>`, where `<hex>` is the HMAC-SHA256 of the **raw request body**
+using a secret. Compare in constant time.
+
+### Outbound: get notified when an item is added
+
+Register a subscriber (`https://` only; private, loopback and link-local
+addresses are refused; max 5 active per household):
+
+```bash
+curl -X POST localhost:8000/api/households/Q38PQZ/webhooks \
+  -H 'Content-Type: application/json' -d '{"url": "https://example.com/hook"}'
+# -> {"id": "...", "url": "...", "active": true, "secret": "...", "inbound_secret": "..."}
+```
+
+`secret` (and `inbound_secret`, returned only with the household's first
+subscriber) are shown **once** and are never returned again. Store them.
+
+Whenever an item is added, whether through the REST route or an inbound
+webhook, every active subscriber gets a `POST` in a background task (it never
+delays the API response):
+
+```json
+{"type": "item.added", "id": "<event id>", "timestamp": "<ISO 8601>",
+ "data": {"household": "Q38PQZ", "item": {"id": "...", "name": "Milk", ...}}}
+```
+
+with headers `X-Webhook-Signature` (signed with that subscriber's `secret`) and
+`X-Webhook-Id`. Reply with any 2xx to acknowledge.
+
+**Retries:** up to 3 attempts, waiting 1s, then 2s between them. Each request
+has a 10s hard timeout and redirects are not followed. Any non-2xx response,
+timeout or connection error counts as a failed attempt. After the last
+attempt fails the delivery is dead-lettered: its `webhook_deliveries` row keeps
+the attempt count, last status and last error, with `delivered_at` and
+`next_retry_at` both empty, and nothing is retried again. Retries live in
+memory, so a restart mid-retry abandons them. Tune via `webhook_config.py`
+(or the `WEBHOOK_*` env vars).
+
+### Inbound: let a third party add items
+
+`POST /api/webhooks/<code>/events` with a body signed using the household's
+`inbound_secret`:
+
+```json
+{"id": "evt-123", "type": "item.added", "data": {"name": "Milk", "added_by": "Ana"}}
+```
+
+- `401` for a missing or invalid signature (checked before the body is parsed),
+  `404` for an unknown household code.
+- The event ID comes from the `X-Webhook-Id` header, falling back to `id` in
+  the body. Replaying an ID returns `200 {"status": "duplicate"}` and does
+  nothing.
+- Valid events do exactly what the REST route does: insert, WebSocket
+  broadcast, outbound webhooks. Only `item.added` is supported today; new types
+  are one entry in `INBOUND_EVENTS` in `app.py`.
+- The inbound secret cannot currently be rotated.
+- If a subscriber also posts back to this endpoint, an item.added event can
+  loop; deduplicate on your side.
+
+## Push notifications (OneSignal)
+
+When an item is added (REST or inbound webhook) the API asks OneSignal to push
+`"<added_by> added <item>"` to every device tagged `household=<code>` except
+those tagged `user=<added_by>`. Without `added_by`, all the household's devices
+are notified. It is one attempt in a background task; a failure is logged and
+never affects the request.
+
+1. Create a Web Push app at [onesignal.com](https://onesignal.com) for the PWA's
+   URL (a separate app from any other project).
+2. Set `ONESIGNAL_APP_ID` and `ONESIGNAL_API_KEY` (Settings -> Keys & IDs) in
+   `.env` locally and in Render's environment. The API key is a secret.
+   If either is unset, push is silently disabled.
+3. The PWA must initialise OneSignal and tag each device with `household` (the
+   household code) and `user` (the display name it sends as `added_by`).
+   Two people with the same display name would silence each other.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
 ```
 
 ## Notes for later
@@ -88,7 +181,5 @@ db.py     — asyncpg pool, schema, all queries (households/lists/items)
 - **Household codes never expire and aren't rate-limited.** Fine for personal
   use; if you ever share this more widely, add rate limiting on
   `POST /api/households` and code guessing on the other endpoints.
-- **No push notifications here** — the WebSocket already gives you real-time
-  sync while the app is open. If you want a notification when your wife adds
-  something while your phone's closed, that's a separate feature (would need
-  the OneSignal-style setup from the habit tracker).
+- **Push notifications** are sent through OneSignal (see below), so the other
+  person is notified even while the app is closed.

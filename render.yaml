@@ -10,3 +10,7 @@ services:
         sync: false
       - key: ALLOWED_ORIGINS
         value: "*"
+      - key: ONESIGNAL_APP_ID
+        sync: false
+      - key: ONESIGNAL_API_KEY
+        sync: false

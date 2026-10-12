@@ -2,3 +2,4 @@ sanic==25.12.1
 asyncpg==0.31.0
 python-dotenv==1.0.1
 sanic-cors==2.2.0
+httpx==0.28.1
